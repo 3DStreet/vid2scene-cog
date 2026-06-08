@@ -78,12 +78,19 @@ build:
     # the COLMAP install above. Installs the `glomap` binary to /usr/local/bin.
     - "cd /src/vid2scene/glomap && mkdir -p build && cd build && cmake .. -GNinja && ninja && ninja install && cd / && rm -rf /src/vid2scene/glomap/build"
     # --- Python deps (worker only; SaaS server requirements intentionally skipped) ---
-    # IMAGE-SIZE: strip libs not on the video->.ply path from requirements_worker:
-    #   flet (SaaS GUI), open3d (render/visualize only), depth-anything-3,
-    #   transparent-background (the remove_background option only), torchaudio,
-    #   decord, pycocotools, pupil-apriltags (apriltag calibration only).
-    # Keeps torch 2.5.1+cu124, plyfile, pycolmap_parser, pyceres, pilgram, etc.
-    - "grep -vE '^(torchaudio$|transparent-background|flet|pupil-apriltags|open3d|decord|pycocotools|depth-anything-3)' /src/vid2scene/requirements_worker.txt > /tmp/req_slim.txt && pip install --no-cache-dir -r /tmp/req_slim.txt"
+    # IMAGE-SIZE: strip libs not on any exposed path from requirements_worker:
+    #   open3d (render/visualize only), depth-anything-3, torchaudio, decord,
+    #   pycocotools. KEPT: transparent-background (remove_background input),
+    #   pupil-apriltags (apriltag_size_meters), and flet==0.27.6 — which is NOT
+    #   for our use but is a hard import dep of transparent_background 1.3.3
+    #   (its __init__ imports a flet GUI module; only flet 0.27.x has the API it
+    #   needs, so it must stay pinned). Plus torch 2.5.1+cu124, plyfile,
+    #   pycolmap_parser, pyceres, pilgram, etc.
+    - "grep -vE '^(torchaudio$|open3d|decord|pycocotools|depth-anything-3)' /src/vid2scene/requirements_worker.txt > /tmp/req_slim.txt && pip install --no-cache-dir -r /tmp/req_slim.txt"
+    # Pre-bake the InSPyReNet 'fast' weights (what remove_background.py uses) into
+    # the image so an enabled remove_background run doesn't download ~180MB on a
+    # cold container. device=cpu so it works on the GPU-less build box.
+    - "python -c \"from transparent_background import Remover; Remover(mode='fast', device='cpu')\" || echo 'WARN: InSPyReNet pre-bake failed; will download at runtime'"
     # gsplat training stack: fused CUDA kernels (built ahead-of-time for the
     # target arches since there's no GPU at build) + the example trainer's deps.
     - "export TORCH_CUDA_ARCH_LIST='7.5;8.6;8.9' && pip install --no-cache-dir git+https://github.com/rahul-goel/fused-ssim@328dc9836f513d00c4b5bc38fe30478b4435cbb5 --no-build-isolation"

@@ -114,6 +114,25 @@ class Predictor(BasePredictor):
             description="Treat the input as 360/equirectangular video.",
             default=False,
         ),
+        use_background_sphere: bool = Input(
+            description="Add a background sphere for distant/sky content. Helps "
+            "outdoor or 360 captures where the background is far away.",
+            default=False,
+        ),
+        remove_background: bool = Input(
+            description="Remove the background from each frame before "
+            "reconstruction (InSPyReNet). Good for isolating a single object; "
+            "leave OFF for scenes/environments where you want the surroundings.",
+            default=False,
+        ),
+        apriltag_size_meters: float = Input(
+            description="If an AprilTag of known physical size (in meters) is "
+            "visible in the video, set it here to scale the reconstruction to "
+            "real-world units. Leave unset to skip metric scaling.",
+            default=None,
+            ge=0.01,
+            le=10.0,
+        ),
     ) -> Path:
         work_dir = tempfile.mkdtemp(prefix="vid2scene_")
         out_dir = os.path.join(work_dir, "out")
@@ -129,6 +148,9 @@ class Predictor(BasePredictor):
                 output_dir=out_dir,
                 target_framecount=target_framecount,
                 equirectangular=equirectangular,
+                use_background_sphere=use_background_sphere,
+                remove_background_from_images=remove_background,
+                apriltag_size_meters=apriltag_size_meters,
                 training_max_num_gaussians=training_max_num_gaussians,
                 training_num_steps=training_num_steps,
                 reconstruction_method=reconstruction_method,
