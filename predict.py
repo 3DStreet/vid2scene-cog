@@ -100,11 +100,15 @@ class Predictor(BasePredictor):
             le=30000,
         ),
         training_max_num_gaussians: int = Input(
-            description="Cap on the number of Gaussians (also caps the output "
-            ".ply size — keep generated splats under 3DStreet's 100 MB ceiling).",
-            default=1000000,
+            description="Cap on the number of Gaussians. This is the primary "
+            "control on output .ply size: the gsplat exporter writes 164 bytes "
+            "per Gaussian (position + SH degree-2 color + opacity/scale/rot), so "
+            "~640k Gaussians ~= 100 MB. The ceiling here (600k ~= 98 MB) keeps "
+            "every output under 3DStreet's 100 MB save limit; the default 500k "
+            "(~82 MB) leaves headroom.",
+            default=500000,
             ge=100000,
-            le=3000000,
+            le=600000,
         ),
         equirectangular: bool = Input(
             description="Treat the input as 360/equirectangular video.",
