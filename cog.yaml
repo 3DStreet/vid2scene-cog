@@ -50,38 +50,49 @@ build:
     - "libgtest-dev"
     - "libgmock-dev"
     - "libsqlite3-dev"
-    - "libglew-dev"
-    - "qtbase5-dev"
-    - "libqt5opengl5-dev"
     - "libcgal-dev"
     - "libceres-dev"
+    # COLMAP 3.10 needs OpenGL + GLEW even with GUI off (SiftGPU links GLEW::GLEW).
+    # These are the lightweight GL libs that satisfy it (vs. the heavy Qt5 stack,
+    # which GUI-off does NOT require).
+    - "libgl1-mesa-dev"
+    - "libglu1-mesa-dev"
+    - "libglew-dev"
   run:
     # Newer CMake than the distro ships (COLMAP/glomap need >= 3.28).
     - "wget -q https://github.com/Kitware/CMake/releases/download/v3.31.0/cmake-3.31.0-linux-x86_64.sh -O /tmp/cmake.sh && sh /tmp/cmake.sh --skip-license --prefix=/usr/local && rm /tmp/cmake.sh"
     # Build COLMAP 3.10 from source (matches upstream's conda colmap=3.10). This
     # provides BOTH the `colmap` CLI the pipeline shells out to (matches_importer,
     # image_registrator) AND the CMake package glomap's find_package(COLMAP) needs.
-    - "git clone --branch 3.10 --depth 1 https://github.com/colmap/colmap.git /src/colmap && cd /src/colmap && mkdir build && cd build && cmake .. -GNinja -DCMAKE_CUDA_ARCHITECTURES='75;86;89' && ninja && ninja install"
-    # Clone the upstream pipeline + vendored submodules (glomap, gsplat, hloc,
-    # vggt). Pinned to a known-good ref for reproducibility.
-    - "git clone https://github.com/samuelm2/vid2scene.git /src/vid2scene && cd /src/vid2scene && git checkout 04559366ce7b3bb4a2ef261f364379c9761623b6 && git submodule update --init --recursive"
+    # GUI/tests off (we only need the CLI) -> no Qt/GLEW, smaller binary. Build
+    # dir removed in-layer so the intermediates don't bloat the image.
+    - "git clone --branch 3.10 --depth 1 https://github.com/colmap/colmap.git /src/colmap && cd /src/colmap && mkdir build && cd build && cmake .. -GNinja -DCMAKE_CUDA_ARCHITECTURES='75;86;89' -DGUI_ENABLED=OFF -DTESTS_ENABLED=OFF && ninja && ninja install && cd / && rm -rf /src/colmap"
+    # Clone the upstream pipeline. IMAGE-SIZE: init ONLY the submodules the
+    # video->.ply path needs (glomap SfM, gsplat trainer, hloc features). We skip
+    # vggt/sam3/quest/svraster (alt methods / SaaS) to keep the image bootable on
+    # Replicate. The `vggt` reconstruction method is not exposed by predict.py, so
+    # its top-level import in vid2scene.py is stubbed to a clear error.
+    - "git clone https://github.com/samuelm2/vid2scene.git /src/vid2scene && cd /src/vid2scene && git checkout 04559366ce7b3bb4a2ef261f364379c9761623b6 && git submodule update --init --recursive glomap gsplat Hierarchical-Localization"
+    - "sed -i 's|^from vggt_to_colmap import run_vggt_to_colmap|def run_vggt_to_colmap(*a, **k): raise RuntimeError(\"vggt reconstruction method is not bundled in this Cog\")|' /src/vid2scene/vid2scene_core/vid2scene.py"
     # Build glomap (default SfM — pure C++ global SfM, no model weights). Finds
     # the COLMAP install above. Installs the `glomap` binary to /usr/local/bin.
-    - "cd /src/vid2scene/glomap && mkdir -p build && cd build && cmake .. -GNinja && ninja && ninja install"
+    - "cd /src/vid2scene/glomap && mkdir -p build && cd build && cmake .. -GNinja && ninja && ninja install && cd / && rm -rf /src/vid2scene/glomap/build"
     # --- Python deps (worker only; SaaS server requirements intentionally skipped) ---
-    # requirements_worker.txt pins torch==2.5.1+cu124 (via its own --extra-index-url),
-    # plus plyfile, pycolmap_parser, decord, pyceres, pilgram, watchdog, etc.
-    - "pip install -r /src/vid2scene/requirements_worker.txt"
-    - "pip install -r /src/vid2scene/vggt/requirements.txt"
+    # IMAGE-SIZE: strip libs not on the video->.ply path from requirements_worker:
+    #   flet (SaaS GUI), open3d (render/visualize only), depth-anything-3,
+    #   transparent-background (the remove_background option only), torchaudio,
+    #   decord, pycocotools, pupil-apriltags (apriltag calibration only).
+    # Keeps torch 2.5.1+cu124, plyfile, pycolmap_parser, pyceres, pilgram, etc.
+    - "grep -vE '^(torchaudio$|transparent-background|flet|pupil-apriltags|open3d|decord|pycocotools|depth-anything-3)' /src/vid2scene/requirements_worker.txt > /tmp/req_slim.txt && pip install --no-cache-dir -r /tmp/req_slim.txt"
     # gsplat training stack: fused CUDA kernels (built ahead-of-time for the
     # target arches since there's no GPU at build) + the example trainer's deps.
-    - "export TORCH_CUDA_ARCH_LIST='7.5;8.6;8.9' && pip install git+https://github.com/rahul-goel/fused-ssim@328dc9836f513d00c4b5bc38fe30478b4435cbb5 --no-build-isolation"
-    - "export TORCH_CUDA_ARCH_LIST='7.5;8.6;8.9' && pip install git+https://github.com/harry7557558/fused-bilagrid@49f0ef06c9f81810fb9b5dd9027cf1844950cc16 --no-build-isolation"
-    - "pip install -r /src/vid2scene/gsplat/examples/requirements.txt"
+    - "export TORCH_CUDA_ARCH_LIST='7.5;8.6;8.9' && pip install --no-cache-dir git+https://github.com/rahul-goel/fused-ssim@328dc9836f513d00c4b5bc38fe30478b4435cbb5 --no-build-isolation"
+    - "export TORCH_CUDA_ARCH_LIST='7.5;8.6;8.9' && pip install --no-cache-dir git+https://github.com/harry7557558/fused-bilagrid@49f0ef06c9f81810fb9b5dd9027cf1844950cc16 --no-build-isolation"
+    - "pip install --no-cache-dir -r /src/vid2scene/gsplat/examples/requirements.txt"
     # pycolmap python bindings (CUDA 12 build); --no-deps so it doesn't drag torch.
-    - "pip install pycolmap-cuda12==3.13.0 --no-deps"
-    - "pip install -r /src/vid2scene/Hierarchical-Localization/requirements.txt"
+    - "pip install --no-cache-dir pycolmap-cuda12==3.13.0 --no-deps"
+    - "pip install --no-cache-dir -r /src/vid2scene/Hierarchical-Localization/requirements.txt"
     # Build + install gsplat (CUDA extension) and hloc from the submodules.
-    - "export TORCH_CUDA_ARCH_LIST='7.5;8.6;8.9' && cd /src/vid2scene/gsplat && pip install ."
-    - "cd /src/vid2scene/Hierarchical-Localization && pip install ."
+    - "export TORCH_CUDA_ARCH_LIST='7.5;8.6;8.9' && cd /src/vid2scene/gsplat && pip install --no-cache-dir ."
+    - "cd /src/vid2scene/Hierarchical-Localization && pip install --no-cache-dir ."
 predict: "predict.py:Predictor"

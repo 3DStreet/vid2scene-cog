@@ -106,9 +106,6 @@ class Predictor(BasePredictor):
             ge=100000,
             le=3000000,
         ),
-        remove_background: bool = Input(
-            description="Remove background before reconstruction.", default=False
-        ),
         equirectangular: bool = Input(
             description="Treat the input as 360/equirectangular video.",
             default=False,
@@ -127,7 +124,6 @@ class Predictor(BasePredictor):
                 video_path=str(video),
                 output_dir=out_dir,
                 target_framecount=target_framecount,
-                remove_background_from_images=remove_background,
                 equirectangular=equirectangular,
                 training_max_num_gaussians=training_max_num_gaussians,
                 training_num_steps=training_num_steps,
