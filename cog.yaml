@@ -4,57 +4,84 @@
 # Redis/django-rq, Azurite blob, Stripe billing). 3DStreet supplies all of that
 # already via its generationJobs queue + Firebase/GCS + token system.
 #
-# This file mirrors the build steps from the upstream `Worker_Dockerfile`
-# (pytorch 2.5.1 / CUDA 12.4; compile glomap, ply-to-sog, 3dgs-autolod, spz;
-# pip install gsplat). It is authored to be correct but MUST be built/validated
-# on a CUDA + NVIDIA-GPU machine — it cannot be built in a CPU sandbox. See
-# README.md for the build/push steps and for the alternative "wrap the upstream
-# Dockerfile" strategy.
+# This mirrors the *worker* build steps from the upstream `Worker_Dockerfile`
+# (github.com/samuelm2/vid2scene), with three deliberate deviations:
 #
-# Pin VID2SCENE_REF to a specific upstream commit before publishing so rebuilds
-# are reproducible.
+#   1. No conda. Upstream runs the worker inside a conda env (`env_cuda_colmap`)
+#      whose main job is to provide the COLMAP 3.10 binary + a C++/CUDA toolchain.
+#      Cog manages its own (pip) Python env, so instead we build COLMAP 3.10 from
+#      source (deterministic, matches the conda pin) and apt-install the C++ deps.
+#   2. No SaaS deps. We do NOT install `vid2scene_server/requirements.txt`
+#      (Django/Postgres/Azure/Redis/Sentry) — nothing in vid2scene_core's import
+#      chain needs it, and 3DStreet provides queue/storage/auth.
+#   3. Trimmed tools. spz, ply-to-sog, 3dgs-autolod and sam3 are NOT on the
+#      video→.ply path (they're SaaS preview/export + optional segmentation), so
+#      they are not built. The 3DStreet RAD/LOD step handles optimization later.
+#
+# Upstream commit is pinned below for reproducible rebuilds.
 build:
   gpu: true
   cuda: "12.4"
-  python_version: "3.11"
+  # Match upstream's python 3.10.13 — maximizes binary-wheel availability for the
+  # pinned deps (decord, pyceres, pycolmap-cuda12, depth-anything-3, …).
+  python_version: "3.10"
   system_packages:
     - "git"
     - "wget"
     - "ffmpeg"
     - "build-essential"
+    - "clang"
+    - "libomp-dev"
     - "ninja-build"
     - "pkg-config"
+    # COLMAP + glomap build deps (union from upstream Worker_Dockerfile).
     - "libboost-program-options-dev"
     - "libboost-graph-dev"
     - "libboost-system-dev"
+    - "libboost-filesystem-dev"
+    - "libboost-test-dev"
+    - "libboost-iostreams-dev"
     - "libeigen3-dev"
-    - "libceres-dev"
-    - "libcgal-dev"
     - "libflann-dev"
-    - "libsqlite3-dev"
     - "libfreeimage-dev"
     - "libmetis-dev"
     - "libgoogle-glog-dev"
     - "libgflags-dev"
-    - "libwebp-dev"
-    - "clang"
+    - "libgtest-dev"
+    - "libgmock-dev"
+    - "libsqlite3-dev"
+    - "libglew-dev"
+    - "qtbase5-dev"
+    - "libqt5opengl5-dev"
+    - "libcgal-dev"
+    - "libceres-dev"
   run:
     # Newer CMake than the distro ships (COLMAP/glomap need >= 3.28).
     - "wget -q https://github.com/Kitware/CMake/releases/download/v3.31.0/cmake-3.31.0-linux-x86_64.sh -O /tmp/cmake.sh && sh /tmp/cmake.sh --skip-license --prefix=/usr/local && rm /tmp/cmake.sh"
-    # Clone the upstream pipeline + vendored submodules (glomap, gsplat, spz,
-    # ply-to-sog, 3dgs-autolod, hloc). Pin to a known-good ref for reproducibility.
-    - "git clone https://github.com/samuelm2/vid2scene.git /src/vid2scene && cd /src/vid2scene && git checkout ${VID2SCENE_REF:-main} && git submodule update --init --recursive"
-    # Build glomap (default SfM — pure C++, no model weights).
-    - "cd /src/vid2scene && mkdir -p third_party/glomap/build && cd third_party/glomap/build && cmake .. -GNinja && ninja && ninja install"
-    # Build the .ply → SOG exporter.
-    - "cd /src/vid2scene/vid2scene_core/ply-to-sog 2>/dev/null && mkdir -p build && cd build && cmake .. && make -j$(nproc) || echo 'ADJUST: ply-to-sog path/build — verify against upstream Worker_Dockerfile'"
-    # Build the autolod (LOD) tool.
-    - "cd /src/vid2scene/vid2scene_core/autolod_cpp 2>/dev/null && mkdir -p build && cd build && cmake .. && make -j$(nproc) || echo 'ADJUST: 3dgs-autolod path/build — verify against upstream Worker_Dockerfile'"
-    # Build spz (compressed splat format).
-    - "cd /src/vid2scene && find . -maxdepth 4 -name build_native.sh -execdir bash build_native.sh \\; || echo 'ADJUST: spz build_native.sh — verify path against upstream Worker_Dockerfile'"
-    # gsplat (training) + the pipeline's Python deps. pycolmap must match CUDA 12.
-    - "pip install 'pycolmap-cuda12==3.13.0'"
-    - "pip install -e /src/vid2scene/vid2scene_core/gsplat || pip install gsplat"
-    - "pip install -r /src/vid2scene/vid2scene_server/requirements.txt || true"
-    - "pip install -r /src/vid2scene/vid2scene_core/requirements.txt || true"
+    # Build COLMAP 3.10 from source (matches upstream's conda colmap=3.10). This
+    # provides BOTH the `colmap` CLI the pipeline shells out to (matches_importer,
+    # image_registrator) AND the CMake package glomap's find_package(COLMAP) needs.
+    - "git clone --branch 3.10 --depth 1 https://github.com/colmap/colmap.git /src/colmap && cd /src/colmap && mkdir build && cd build && cmake .. -GNinja -DCMAKE_CUDA_ARCHITECTURES='75;86;89' && ninja && ninja install"
+    # Clone the upstream pipeline + vendored submodules (glomap, gsplat, hloc,
+    # vggt). Pinned to a known-good ref for reproducibility.
+    - "git clone https://github.com/samuelm2/vid2scene.git /src/vid2scene && cd /src/vid2scene && git checkout 04559366ce7b3bb4a2ef261f364379c9761623b6 && git submodule update --init --recursive"
+    # Build glomap (default SfM — pure C++ global SfM, no model weights). Finds
+    # the COLMAP install above. Installs the `glomap` binary to /usr/local/bin.
+    - "cd /src/vid2scene/glomap && mkdir -p build && cd build && cmake .. -GNinja && ninja && ninja install"
+    # --- Python deps (worker only; SaaS server requirements intentionally skipped) ---
+    # requirements_worker.txt pins torch==2.5.1+cu124 (via its own --extra-index-url),
+    # plus plyfile, pycolmap_parser, decord, pyceres, pilgram, watchdog, etc.
+    - "pip install -r /src/vid2scene/requirements_worker.txt"
+    - "pip install -r /src/vid2scene/vggt/requirements.txt"
+    # gsplat training stack: fused CUDA kernels (built ahead-of-time for the
+    # target arches since there's no GPU at build) + the example trainer's deps.
+    - "export TORCH_CUDA_ARCH_LIST='7.5;8.6;8.9' && pip install git+https://github.com/rahul-goel/fused-ssim@328dc9836f513d00c4b5bc38fe30478b4435cbb5 --no-build-isolation"
+    - "export TORCH_CUDA_ARCH_LIST='7.5;8.6;8.9' && pip install git+https://github.com/harry7557558/fused-bilagrid@49f0ef06c9f81810fb9b5dd9027cf1844950cc16 --no-build-isolation"
+    - "pip install -r /src/vid2scene/gsplat/examples/requirements.txt"
+    # pycolmap python bindings (CUDA 12 build); --no-deps so it doesn't drag torch.
+    - "pip install pycolmap-cuda12==3.13.0 --no-deps"
+    - "pip install -r /src/vid2scene/Hierarchical-Localization/requirements.txt"
+    # Build + install gsplat (CUDA extension) and hloc from the submodules.
+    - "export TORCH_CUDA_ARCH_LIST='7.5;8.6;8.9' && cd /src/vid2scene/gsplat && pip install ."
+    - "cd /src/vid2scene/Hierarchical-Localization && pip install ."
 predict: "predict.py:Predictor"

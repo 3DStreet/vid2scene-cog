@@ -41,20 +41,35 @@ import subprocess
 
 from cog import BasePredictor, Input, Path
 
-# Where cog.yaml clones the upstream repo. `vid2scene_core` must be importable
-# (its modules use sibling imports like `import extract_frames`) and on PATH so
-# the compiled binaries it shells out to are found.
+# Where cog.yaml clones the upstream repo. Two paths must be importable:
+#   - VID2SCENE_CORE: the pipeline package itself (its modules use sibling imports
+#     like `import extract_frames`).
+#   - VID2SCENE_REPO (repo root): so module-level `import vggt` (pulled in by
+#     vid2scene.py -> vggt_to_colmap) resolves to the vendored vggt submodule.
+# Both must also be on PATH so the compiled binaries the pipeline shells out to
+# (colmap, glomap) are found.
 VID2SCENE_REPO = os.environ.get("VID2SCENE_REPO", "/src/vid2scene")
 VID2SCENE_CORE = os.path.join(VID2SCENE_REPO, "vid2scene_core")
+
+# The gsplat trainer the pipeline launches as a subprocess (run_gsplat reads
+# GSPLAT_SCRIPT). Matches the upstream Worker_Dockerfile's GSPLAT_SCRIPT env.
+GSPLAT_SCRIPT = os.environ.get(
+    "GSPLAT_SCRIPT", os.path.join(VID2SCENE_REPO, "gsplat", "examples", "simple_trainer.py")
+)
 
 
 class Predictor(BasePredictor):
     def setup(self):
-        if VID2SCENE_CORE not in sys.path:
-            sys.path.insert(0, VID2SCENE_CORE)
-        # Make any locally-installed binaries (glomap install prefix, etc.)
-        # discoverable. /usr/local/bin is glomap's default `ninja install` target.
+        # repo root first so `import vggt` (vendored submodule) resolves, then the
+        # core package for the sibling imports inside the pipeline.
+        for p in (VID2SCENE_REPO, VID2SCENE_CORE):
+            if p not in sys.path:
+                sys.path.insert(0, p)
+        # Make locally-installed binaries (colmap/glomap `ninja install` target)
+        # discoverable; /usr/local/bin is the default prefix.
         os.environ["PATH"] = f"/usr/local/bin:{os.environ.get('PATH', '')}"
+        # The pipeline requires GSPLAT_SCRIPT to be set (raises ValueError if not).
+        os.environ["GSPLAT_SCRIPT"] = GSPLAT_SCRIPT
         # Import lazily so an import error surfaces clearly at predict time.
         from vid2scene import process_video_to_scene  # noqa: F401
 
