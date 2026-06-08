@@ -77,13 +77,15 @@ class Predictor(BasePredictor):
 
     def predict(
         self,
+        # NOTE: keep every `description` a SINGLE-LINE string. coglet captures the
+        # raw source of multi-line implicitly-concatenated literals (quotes +
+        # newlines + indentation) into the schema, which shows up garbled in the
+        # Replicate UI. One line each = clean labels.
         video: Path = Input(
-            description="Source video (a slow, steady orbit around a static "
-            "subject works best)."
+            description="Source video. A slow, steady orbit around a static subject works best.",
         ),
         reconstruction_method: str = Input(
-            description="Structure-from-Motion method. glomap (default) needs no "
-            "model weights.",
+            description="Structure-from-Motion method. glomap (default) needs no model weights.",
             choices=["glomap", "colmap"],
             default="glomap",
         ),
@@ -100,12 +102,7 @@ class Predictor(BasePredictor):
             le=30000,
         ),
         training_max_num_gaussians: int = Input(
-            description="Cap on the number of Gaussians. This is the primary "
-            "control on output .ply size: the gsplat exporter writes 164 bytes "
-            "per Gaussian (position + SH degree-2 color + opacity/scale/rot), so "
-            "~640k Gaussians ~= 100 MB. The ceiling here (600k ~= 98 MB) keeps "
-            "every output under 3DStreet's 100 MB save limit; the default 500k "
-            "(~82 MB) leaves headroom.",
+            description="Cap on the number of Gaussians, the primary control on output .ply size (~164 bytes/Gaussian). The 600k ceiling keeps every output under 3DStreet's 100 MB save limit; the 500k default leaves headroom (~82 MB).",
             default=500000,
             ge=100000,
             le=600000,
@@ -115,22 +112,17 @@ class Predictor(BasePredictor):
             default=False,
         ),
         use_background_sphere: bool = Input(
-            description="Add a background sphere for distant/sky content. Helps "
-            "outdoor or 360 captures where the background is far away.",
-            default=False,
+            description="Add a background sphere for distant/sky content. Helps outdoor or 360 captures where the background is far away.",
+            default=True,
         ),
         remove_background: bool = Input(
-            description="Remove the background from each frame before "
-            "reconstruction (InSPyReNet). Good for isolating a single object; "
-            "leave OFF for scenes/environments where you want the surroundings.",
+            description="Remove the background from each frame before reconstruction (InSPyReNet). Good for isolating a single object; leave off for scenes/environments where you want the surroundings.",
             default=False,
         ),
         apriltag_size_meters: float = Input(
-            description="If an AprilTag of known physical size (in meters) is "
-            "visible in the video, set it here to scale the reconstruction to "
-            "real-world units. Leave unset to skip metric scaling.",
-            default=None,
-            ge=0.01,
+            description="Optional. If an AprilTag of known physical size (in meters) is visible in the video, set it to scale the reconstruction to real-world units. Leave at 0 to skip AprilTag detection entirely.",
+            default=0.0,
+            ge=0.0,
             le=10.0,
         ),
     ) -> Path:
@@ -150,7 +142,9 @@ class Predictor(BasePredictor):
                 equirectangular=equirectangular,
                 use_background_sphere=use_background_sphere,
                 remove_background_from_images=remove_background,
-                apriltag_size_meters=apriltag_size_meters,
+                # 0 (the optional default) means "no AprilTag" — pass None so the
+                # pipeline skips detection (it treats None/<=0 as disabled).
+                apriltag_size_meters=(apriltag_size_meters or None),
                 training_max_num_gaussians=training_max_num_gaussians,
                 training_num_steps=training_num_steps,
                 reconstruction_method=reconstruction_method,
