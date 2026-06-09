@@ -102,10 +102,10 @@ class Predictor(BasePredictor):
             le=30000,
         ),
         training_max_num_gaussians: int = Input(
-            description="Cap on the number of Gaussians, the primary control on output .ply size (~164 bytes/Gaussian). The 600k ceiling keeps every output under 3DStreet's 100 MB save limit; the 500k default leaves headroom (~82 MB).",
+            description="Cap on the number of Gaussians: the primary control on output detail and .ply size (~164 bytes/Gaussian, so 5M is ~820 MB). Higher means more detail and a larger file. The 500k default is a sensible mid-range; raise it for large or complex scenes. File-size gating per user tier is enforced by 3DStreet on save.",
             default=500000,
             ge=100000,
-            le=600000,
+            le=10000000,
         ),
         equirectangular: bool = Input(
             description="Treat the input as 360/equirectangular video.",
