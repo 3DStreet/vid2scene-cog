@@ -1,3 +1,12 @@
+# macOS
+.DS_Store
+
+# Private session handoff (contains tokenomics — keep out of the public repo)
+HANDOFF_PROMPT.md
+
+# Test/output artifacts
+*.ply
+
 # Logs
 logs
 *.log
