@@ -102,4 +102,11 @@ build:
     # Build + install gsplat (CUDA extension) and hloc from the submodules.
     - "export TORCH_CUDA_ARCH_LIST='7.5;8.6;8.9' && cd /src/vid2scene/gsplat && pip install --no-cache-dir ."
     - "cd /src/vid2scene/Hierarchical-Localization && pip install --no-cache-dir ."
+    # Pre-bake the hloc SfM feature weights (~565 MB: eigenplaces/cosplace +
+    # ResNet101 retrieval, ALIKED-n16, aliked+lightglue) into the image's torch
+    # hub cache. Otherwise they download at every cold boot — slow, and a runtime
+    # dependency on github.com / download.pytorch.org being up. Mirrors the confs
+    # used by vid2scene_core/generate_sfm_hloc.py. Best-effort; on failure they
+    # just fall back to the old runtime download (no regression).
+    - "python -c \"from hloc import extract_features, match_features, extractors, matchers; from hloc.utils.base_model import dynamic_load; [dynamic_load(extractors, c['model']['name'])(c['model']).eval() for c in (extract_features.confs['eigenplaces'], extract_features.confs['aliked-n16'])]; m=match_features.confs['aliked+lightglue']; dynamic_load(matchers, m['model']['name'])(m['model']).eval(); print('hloc weights pre-baked')\" || echo 'WARN: hloc weight pre-bake failed; will download at runtime'"
 predict: "predict.py:Predictor"

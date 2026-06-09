@@ -85,7 +85,7 @@ class Predictor(BasePredictor):
             description="Source video. A slow, steady orbit around a static subject works best.",
         ),
         reconstruction_method: str = Input(
-            description="Structure-from-Motion method. glomap (default) needs no model weights.",
+            description="Structure-from-Motion method. glomap (default): fast global SfM, recommended. colmap: slower incremental, sometimes more robust on difficult captures.",
             choices=["glomap", "colmap"],
             default="glomap",
         ),
