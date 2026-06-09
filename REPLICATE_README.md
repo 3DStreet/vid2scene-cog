@@ -17,9 +17,9 @@ This is a [Cog](https://github.com/replicate/cog) packaging of **[vid2scene](htt
 Upload a video and (optionally) tune:
 - `target_framecount` — frames sampled from the video
 - `training_num_steps` — gsplat steps (quality vs. speed)
-- `training_max_num_gaussians` — caps `.ply` size (≤ 600k ≈ 98 MB)
+- `training_max_num_gaussians` — caps Gaussian count / `.ply` size & detail (up to 10M; ~164 B each)
 - `reconstruction_method`, `equirectangular`, `use_background_sphere`, `remove_background`, `apriltag_size_meters` (real-world scale)
 
 Output is one `.ply` — drop it into [3DStreet](https://3dstreet.org), [Spark](https://github.com/sparkjsdev/spark), or any splat viewer.
 
-Runs on **L40S**. Built/maintained by [3DStreet](https://3dstreet.org).
+Runs on **L40S**. Built for **[3DStreet](https://3dstreet.org)** — the easiest way to turn video into splats without running this yourself. Provided as-is under Apache 2.0, with no warranty or guarantee of updates; fork and self-host if you'd rather run your own.
