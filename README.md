@@ -6,7 +6,7 @@ The image is **platform-independent**: it's a self-contained container that take
 
 > **Why this exists:** vid2scene is [winding down its web operations](https://vid2scene.com/winddown/) (June 13, 2026) and the team generously open-sourced the codebase under **Apache 2.0**. Huge thanks to Sam and the SamuSynth team. This Cog repackages their excellent work so the reconstruction pipeline keeps living on. All the hard parts (the SfM + gsplat pipeline, the tooling, the tuning) are theirs.
 
-Upstream is **pinned** to [`3DStreet/vid2scene@04559366`](https://github.com/3DStreet/vid2scene/commit/04559366ce7b3bb4a2ef261f364379c9761623b6) in `cog.yaml` for reproducible rebuilds (a byte-identical fork of `samuelm2/vid2scene` at the same commit).
+Upstream is **pinned** to [`3DStreet/vid2scene@eca9db7c`](https://github.com/3DStreet/vid2scene/commit/eca9db7cd6b063175832f5aced0bbbfbc09cef7a) in `cog.yaml` for reproducible rebuilds — a fork of `samuelm2/vid2scene` carrying small wrapper-support patches (SfM/training split-resume hooks, a frame-resolution knob, subprocess log-level fixes).
 
 ---
 
