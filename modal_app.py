@@ -46,9 +46,11 @@ A synchronous `.remote()` path is included for local testing / calibration.
 """
 
 import os
+import shutil
 import sys
 import tempfile
 import urllib.request
+import uuid
 
 import modal
 
@@ -83,6 +85,35 @@ CPU = float(os.environ.get("VID2SCENE_CPU", "16"))  # physical cores -> faster S
 MEMORY_MB = int(os.environ.get("VID2SCENE_MEM_MB", "32768"))
 TIMEOUT_S = int(os.environ.get("VID2SCENE_TIMEOUT_S", "7200"))  # 2h: covers max tier
 
+# Split-shape tunables (see "THE SPLIT SHAPE" below). Calibration run #1 measured
+# the single-function shape at ~$1.81/h — over the COGS cap for the default tier.
+# The job is two opposite workloads, so each stage gets its own machine:
+#   SfM:   CPU-hot, GPU only for hloc feature extraction/matching -> T4 + 16 cores
+#   train: GPU-hot, ~2 cores busy                                 -> L4 + 4 cores
+SFM_GPU = os.environ.get("VID2SCENE_SFM_GPU", "T4")
+SFM_CPU = float(os.environ.get("VID2SCENE_SFM_CPU", "16"))
+SFM_MEM_MB = int(os.environ.get("VID2SCENE_SFM_MEM_MB", "24576"))
+TRAIN_GPU = os.environ.get("VID2SCENE_TRAIN_GPU", "L4")
+TRAIN_CPU = float(os.environ.get("VID2SCENE_TRAIN_CPU", "4"))
+TRAIN_MEM_MB = int(os.environ.get("VID2SCENE_TRAIN_MEM_MB", "16384"))
+
+# Handoff volume for the split shape. Stages do their actual work on local disk
+# (COLMAP's sqlite and gsplat's per-step image reads are too random for FUSE)
+# and use the volume only to pass `sfm_output/` from one machine to the other;
+# the train stage deletes the job's directory once the .ply is shipped.
+work_volume = modal.Volume.from_name("vid2scene-work", create_if_missing=True)
+
+
+def _load_predictor():
+    """Predictor from the baked predict.py — the same code Replicate runs."""
+    if "/src" not in sys.path:
+        sys.path.insert(0, "/src")
+    from predict import Predictor
+
+    predictor = Predictor()
+    predictor.setup()
+    return predictor
+
 
 @app.cls(
     image=image,
@@ -100,12 +131,7 @@ class Vid2Scene:
     def setup(self):
         # Reuse the EXACT Replicate setup: sys.path/env wiring + lazy import of
         # process_video_to_scene. No logic forked from predict.py.
-        if "/src" not in sys.path:
-            sys.path.insert(0, "/src")
-        from predict import Predictor
-
-        self._predictor = Predictor()
-        self._predictor.setup()
+        self._predictor = _load_predictor()
         self._process = self._predictor._process
 
     @modal.method()
@@ -203,6 +229,170 @@ def _post_webhook(payload: dict) -> None:
         print(f"WARN: webhook POST failed: {e}")
 
 
+# --- THE SPLIT SHAPE (requires the image with predict.py's stage API) ---------
+# Two functions with opposite resource shapes, handing sfm_output/ off via the
+# volume. Projected COGS for the default tier: ~$0.46 (SfM, T4+16cpu) + ~$0.48
+# (train, L4+4cpu) ≈ $0.94 vs ~$1.36 measured on the single-function shape.
+
+
+@app.cls(
+    image=image,
+    gpu=SFM_GPU,
+    cpu=SFM_CPU,
+    memory=SFM_MEM_MB,
+    timeout=TIMEOUT_S,
+    scaledown_window=120,
+    volumes={"/work": work_volume},
+)
+class Vid2SceneSfM:
+    @modal.enter()
+    def setup(self):
+        self._predictor = _load_predictor()
+
+    @modal.method()
+    def run_sfm(
+        self,
+        video_url: str,
+        *,
+        job_id: str,
+        reconstruction_method: str = "glomap",
+        target_framecount: int = 600,
+        resolution: int = 1920,
+        equirectangular: bool = False,
+        use_background_sphere: bool = True,
+        remove_background: bool = False,
+        apriltag_size_meters: float = 0.0,
+    ) -> dict:
+        """Stage A: video -> SfM artifacts, copied to /work/{job_id}/sfm_output."""
+        work_dir = tempfile.mkdtemp(prefix="vid2scene_")
+        out_dir = os.path.join(work_dir, "out")
+        os.makedirs(out_dir, exist_ok=True)
+        video_path = os.path.join(work_dir, "input")
+        urllib.request.urlretrieve(video_url, video_path)
+
+        sfm_dir = self._predictor.run_sfm(
+            video_path=video_path,
+            out_dir=out_dir,
+            target_framecount=target_framecount,
+            resolution=resolution,
+            equirectangular=equirectangular,
+            use_background_sphere=use_background_sphere,
+            remove_background=remove_background,
+            apriltag_size_meters=(apriltag_size_meters or None),
+            reconstruction_method=reconstruction_method,
+        )
+
+        handoff_dir = os.path.join("/work", job_id, "sfm_output")
+        shutil.copytree(sfm_dir, handoff_dir)
+        work_volume.commit()
+        shutil.rmtree(work_dir, ignore_errors=True)
+        # AprilTag scaling fixes real-world units; training must not renormalize.
+        return {"job_id": job_id, "normalize": not apriltag_size_meters}
+
+
+@app.cls(
+    image=image,
+    gpu=TRAIN_GPU,
+    cpu=TRAIN_CPU,
+    memory=TRAIN_MEM_MB,
+    timeout=TIMEOUT_S,
+    scaledown_window=120,
+    volumes={"/work": work_volume},
+    secrets=[modal.Secret.from_name("vid2scene-io")],
+)
+class Vid2SceneTrain:
+    @modal.enter()
+    def setup(self):
+        self._predictor = _load_predictor()
+
+    @modal.method()
+    def run_train(
+        self,
+        *,
+        job_id: str,
+        training_num_steps: int = 30000,
+        training_max_num_gaussians: int = 500000,
+        normalize: bool = True,
+    ) -> dict:
+        """Stage B: /work/{job_id}/sfm_output -> .ply -> GCS + webhook."""
+        work_volume.reload()
+        handoff_dir = os.path.join("/work", job_id, "sfm_output")
+        if not os.path.isdir(handoff_dir):
+            raise RuntimeError(f"no SfM handoff at {handoff_dir} — did run_sfm succeed?")
+
+        work_dir = tempfile.mkdtemp(prefix="vid2scene_")
+        out_dir = os.path.join(work_dir, "out")
+        os.makedirs(out_dir, exist_ok=True)
+        local_sfm = os.path.join(out_dir, "sfm_output")
+        shutil.copytree(handoff_dir, local_sfm)
+
+        ply_path = self._predictor.run_train(
+            sfm_dir=local_sfm,
+            out_dir=out_dir,
+            training_max_num_gaussians=training_max_num_gaussians,
+            training_num_steps=training_num_steps,
+            normalize=normalize,
+        )
+
+        candidate = ply_path or os.path.join(out_dir, "ply", "splat.ply")
+        if not candidate or not os.path.exists(candidate):
+            import glob
+
+            found = glob.glob(os.path.join(out_dir, "**", "*.ply"), recursive=True)
+            if not found:
+                raise RuntimeError("vid2scene produced no .ply — check job logs.")
+            candidate = found[0]
+
+        size = os.path.getsize(candidate)
+        gcs_uri = _upload_to_gcs(candidate, job_id) if os.environ.get("GCS_BUCKET") else None
+        result = {"job_id": job_id, "gcs_uri": gcs_uri, "size_bytes": size}
+
+        # the handoff served its purpose; don't pay volume storage for it
+        shutil.rmtree(os.path.join("/work", job_id), ignore_errors=True)
+        work_volume.commit()
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+        _post_webhook({"status": "succeeded", **result})
+        return result
+
+
+# Thin chaining function: ~zero-cost container (default CPU share) that waits on
+# stage A then launches stage B. Lets enqueue stay fire-and-forget with ONE call
+# id covering the whole job.
+@app.function(image=image, timeout=2 * TIMEOUT_S)
+def run_split(
+    video_url: str,
+    job_id: str | None = None,
+    reconstruction_method: str = "glomap",
+    target_framecount: int = 600,
+    resolution: int = 1920,
+    training_num_steps: int = 30000,
+    training_max_num_gaussians: int = 500000,
+    equirectangular: bool = False,
+    use_background_sphere: bool = True,
+    remove_background: bool = False,
+    apriltag_size_meters: float = 0.0,
+) -> dict:
+    job_id = job_id or uuid.uuid4().hex
+    sfm_result = Vid2SceneSfM().run_sfm.remote(
+        video_url,
+        job_id=job_id,
+        reconstruction_method=reconstruction_method,
+        target_framecount=target_framecount,
+        resolution=resolution,
+        equirectangular=equirectangular,
+        use_background_sphere=use_background_sphere,
+        remove_background=remove_background,
+        apriltag_size_meters=apriltag_size_meters,
+    )
+    return Vid2SceneTrain().run_train.remote(
+        job_id=job_id,
+        training_num_steps=training_num_steps,
+        training_max_num_gaussians=training_max_num_gaussians,
+        normalize=sfm_result["normalize"],
+    )
+
+
 # --- Async enqueue endpoint: this is what 3DStreet's Cloud Task hits ----------
 # It spawns the job and returns immediately with a call id. 3DStreet stores that
 # id on the generationJobs row; the reconciler either waits for the webhook above
@@ -211,22 +401,47 @@ def _post_webhook(payload: dict) -> None:
 @app.function(image=image, secrets=[modal.Secret.from_name("vid2scene-io")])
 @modal.fastapi_endpoint(method="POST")
 def enqueue(body: dict) -> dict:
-    """POST {video_url, job_id, ...knobs} -> {call_id}. Fire-and-forget."""
+    """POST {video_url, job_id, ...knobs} -> {call_id}. Fire-and-forget.
+    Pass "split": false to use the legacy single-machine shape."""
     if os.environ.get("ENQUEUE_SECRET"):
         # NOTE: wire real request-auth here (shared secret / OIDC) before prod.
         pass
     video_url = body.pop("video_url")
-    call = Vid2Scene().run.spawn(video_url, **body)
+    if body.pop("split", True):
+        call = run_split.spawn(video_url, **body)
+    else:
+        call = Vid2Scene().run.spawn(video_url, **body)
     return {"call_id": call.object_id}
 
 
-# --- Local test / calibration: `modal run modal_app.py --video-url <URL>` -----
+# --- Local test / calibration -------------------------------------------------
+#   single shape: modal run --detach modal_app.py --video-url <URL>
+#   split shape:  modal run --detach modal_app.py --video-url <URL> --split
+# (--detach matters for long jobs: ephemeral apps die with the client otherwise)
 @app.local_entrypoint()
-def main(video_url: str, gaussians: int = 500000, steps: int = 30000):
-    res = Vid2Scene().run.remote(
-        video_url,
-        job_id="local-test",
-        training_max_num_gaussians=gaussians,
-        training_num_steps=steps,
-    )
+def main(
+    video_url: str,
+    gaussians: int = 500000,
+    steps: int = 30000,
+    frames: int = 600,
+    resolution: int = 1920,
+    split: bool = False,
+):
+    if split:
+        res = run_split.remote(
+            video_url,
+            job_id=f"local-test-{uuid.uuid4().hex[:8]}",
+            target_framecount=frames,
+            resolution=resolution,
+            training_max_num_gaussians=gaussians,
+            training_num_steps=steps,
+        )
+    else:
+        res = Vid2Scene().run.remote(
+            video_url,
+            job_id="local-test",
+            target_framecount=frames,
+            training_max_num_gaussians=gaussians,
+            training_num_steps=steps,
+        )
     print("result:", res)
