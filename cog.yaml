@@ -5,7 +5,8 @@
 # already via its generationJobs queue + Firebase/GCS + token system.
 #
 # This mirrors the *worker* build steps from the upstream `Worker_Dockerfile`
-# (github.com/samuelm2/vid2scene), with three deliberate deviations:
+# (github.com/3DStreet/vid2scene, fork of github.com/samuelm2/vid2scene), with
+# three deliberate deviations:
 #
 #   1. No conda. Upstream runs the worker inside a conda env (`env_cuda_colmap`)
 #      whose main job is to provide the COLMAP 3.10 binary + a C++/CUDA toolchain.
@@ -72,7 +73,7 @@ build:
     # vggt/sam3/quest/svraster (alt methods / SaaS) to keep the image bootable on
     # Replicate. The `vggt` reconstruction method is not exposed by predict.py, so
     # its top-level import in vid2scene.py is stubbed to a clear error.
-    - "git clone https://github.com/samuelm2/vid2scene.git /src/vid2scene && cd /src/vid2scene && git checkout 04559366ce7b3bb4a2ef261f364379c9761623b6 && git submodule update --init --recursive glomap gsplat Hierarchical-Localization"
+    - "git clone https://github.com/3DStreet/vid2scene.git /src/vid2scene && cd /src/vid2scene && git checkout 04559366ce7b3bb4a2ef261f364379c9761623b6 && git submodule update --init --recursive glomap gsplat Hierarchical-Localization"
     - "sed -i 's|^from vggt_to_colmap import run_vggt_to_colmap|def run_vggt_to_colmap(*a, **k): raise RuntimeError(\"vggt reconstruction method is not bundled in this Cog\")|' /src/vid2scene/vid2scene_core/vid2scene.py"
     # Build glomap (default SfM — pure C++ global SfM, no model weights). Finds
     # the COLMAP install above. Installs the `glomap` binary to /usr/local/bin.
