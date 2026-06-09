@@ -66,8 +66,12 @@ class Predictor(BasePredictor):
             if p not in sys.path:
                 sys.path.insert(0, p)
         # Make locally-installed binaries (colmap/glomap `ninja install` target)
-        # discoverable; /usr/local/bin is the default prefix.
-        os.environ["PATH"] = f"/usr/local/bin:{os.environ.get('PATH', '')}"
+        # discoverable; /usr/local/bin is the default prefix. APPEND, don't prepend:
+        # /usr/local/bin also contains a bare `python` that would shadow the pyenv
+        # interpreter holding all the pip deps, so the gsplat subprocess (`python
+        # simple_trainer.py`) would run under the wrong python (ModuleNotFoundError:
+        # imageio). Appending keeps pyenv's python first while still finding colmap.
+        os.environ["PATH"] = f"{os.environ.get('PATH', '')}:/usr/local/bin"
         # The pipeline requires GSPLAT_SCRIPT to be set (raises ValueError if not).
         os.environ["GSPLAT_SCRIPT"] = GSPLAT_SCRIPT
         # Import lazily so an import error surfaces clearly at predict time.

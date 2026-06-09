@@ -67,7 +67,8 @@ image = (
         secret=modal.Secret.from_name("r8im-pull"),
     )
     # Host-side helpers for I/O glue (the pipeline itself needs none of these).
-    .pip_install("google-cloud-storage", "requests")
+    # fastapi is required by the @modal.fastapi_endpoint `enqueue` route.
+    .pip_install("google-cloud-storage", "requests", "fastapi[standard]")
     # predict.py lives at the cog working dir (/src) in the image; make it import-
     # able so we can reuse Predictor.setup() + the pipeline entrypoint verbatim.
     .env({"PYTHONPATH": "/src"})
@@ -78,7 +79,7 @@ app = modal.App("vid2scene")
 # Tunables. SfM (the ~27-min CPU-bound stage) dominates wall-clock, so give it
 # real cores; gsplat needs the GPU but barely any VRAM (2.5 GB measured).
 GPU = os.environ.get("VID2SCENE_GPU", "L4")        # L4/24GB is ample; T4 also fits
-CPU = float(os.environ.get("VID2SCENE_CPU", "8"))  # physical cores -> faster SfM
+CPU = float(os.environ.get("VID2SCENE_CPU", "16"))  # physical cores -> faster SfM
 MEMORY_MB = int(os.environ.get("VID2SCENE_MEM_MB", "32768"))
 TIMEOUT_S = int(os.environ.get("VID2SCENE_TIMEOUT_S", "7200"))  # 2h: covers max tier
 
