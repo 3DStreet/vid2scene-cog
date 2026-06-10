@@ -17,7 +17,7 @@ Upstream is **pinned** to [`3DStreet/vid2scene@eca9db7c`](https://github.com/3DS
 - [Hardware & cost (COGS)](#hardware--cost-cogs)
 - [Build & push the image](#build--push-the-image)
 - [Run it: Replicate](#run-it-replicate) · [Run it: Modal](#run-it-modal)
-- [Integrating with a host app (3DStreet)](#integrating-with-a-host-app-3dstreet)
+- [Integrating with a host app](#integrating-with-a-host-app)
 - [Background: why run it off-Replicate](#background-why-run-it-off-replicate)
 - [Build issues & fixes](#build-issues-encountered--fixes) · [Known risks](#known-risks) · [Architecture](#architecture-notes) · [Attribution](#attribution)
 
@@ -159,31 +159,60 @@ Configure the GPU tier (L40S/L4/T4 — see [Hardware](#hardware--cost-cogs)) in 
 
 ```bash
 pip install modal && modal token new
-# one-time: store r8.im pull creds so Modal can pull the private image
+# one-time: store registry pull creds so Modal can pull the private image
 modal secret create r8im-pull REGISTRY_USERNAME=<user> REGISTRY_PASSWORD=<replicate-token>
-# optional: GCS upload + completion webhook config
-modal secret create vid2scene-io GCS_BUCKET=<bucket> WEBHOOK_URL=<callback> ...
+# I/O config (every key optional — an unset key disables that feature):
+modal secret create vid2scene-io \
+  GCS_BUCKET=<bucket> \          # upload the finished .ply here
+  WEBHOOK_URL=<callback-url> \   # POST completion/failure here
+  WEBHOOK_SECRET=<token> \       # sent back as "Authorization: Bearer <token>"
+  ENQUEUE_SECRET=<token>         # required as "secret" in enqueue requests
 modal deploy modal_app.py
 
-# local test / calibration (synchronous):
-modal run modal_app.py --video-url <url> --gaussians 500000 --steps 30000
+# local test / calibration (synchronous; --detach survives client disconnects):
+modal run --detach modal_app.py --video-url <url> --split
 ```
 
-Production invocation is async: `POST` to the `enqueue` web endpoint → it `.spawn()`s the job and returns a `call_id` → the job uploads the `.ply` to GCS and POSTs a completion webhook (or the caller polls `FunctionCall.from_id(call_id)`). Tunables (GPU, CPU cores, memory, timeout) are env-vars at the top of `modal_app.py`.
+Production invocation is async, via the `enqueue` web endpoint the deploy prints:
+
+```bash
+curl -X POST https://<workspace>--vid2scene-enqueue.modal.run \
+  -H 'Content-Type: application/json' \
+  -d '{"video_url": "<any fetchable URL>", "job_id": "<your-id>",
+       "secret": "<ENQUEUE_SECRET>", "target_framecount": 600}'
+# -> {"call_id": "..."}   the job runs async (~tens of minutes)
+```
+
+On completion (or failure) the job POSTs to `WEBHOOK_URL`:
+
+```json
+{"status": "succeeded", "job_id": "<your-id>", "gcs_uri": "gs://bucket/vid2scene/<your-id>.ply", "size_bytes": 82001006}
+```
+
+(`"status": "failed"` + `"error"` on failure — useful for refunds/error states.) Callers that prefer polling over webhooks can use `modal.FunctionCall.from_id(call_id).get(timeout=0)` instead. Tunables (GPU types, CPU cores, memory, timeout) are env-vars at the top of `modal_app.py`; by default jobs run as two right-sized stages (CPU-heavy SfM on T4+16cpu, GPU training on L4+4cpu) with idempotent retries.
 
 ---
 
-## Integrating with a host app (3DStreet)
+## Integrating with a host app
 
-[3DStreet](https://3dstreet.app) drives this through its existing job system — **the model is just a compute backend behind that queue**, not a new queue. To add a backend (e.g. Modal alongside Replicate), implement three responsibilities:
+The model is **a stateless compute backend behind your app's existing job system** — it brings no queue, no database, and no opinions about your stack. Your app implements three responsibilities:
 
 | Responsibility | Replicate backend | Modal backend |
 | --- | --- | --- |
 | **Submit** | `POST …/predictions` → prediction id | `POST` the Modal `enqueue` endpoint → `call_id` |
-| **Track** | store prediction id on the job row | store `call_id` on the job row |
-| **Complete** | poll status / webhook → fetch output URL | webhook from the job (or poll the `FunctionCall`) → read `.ply` from GCS |
+| **Track** | store prediction id on your job record | store `call_id` on your job record |
+| **Complete** | poll status / webhook → fetch output URL | webhook from the job (or poll the `FunctionCall`) → read `.ply` from your bucket |
 
-Flow: host enqueues → backend runs (~tens of minutes) → `.ply` lands in storage → host streams it into the user's gallery, and any downstream optimization (e.g. 3DStreet's RAD/LOD step) runs as usual. **Nothing past "produce the `.ply`" changes.** Quality/cost presets (the [knobs above](#quality-vs-cost-the-knobs-that-matter)) are chosen host-side and passed as inputs at submit time.
+Flow: host enqueues → backend runs (~tens of minutes) → `.ply` lands in storage → host serves it to the user; any downstream processing (LOD generation, format conversion, gallery ingestion) runs in your app as usual. **Nothing past "produce the `.ply`" lives here.** Quality/cost presets (the [knobs above](#quality-vs-cost-the-knobs-that-matter)) are chosen host-side and passed as inputs at submit time.
+
+**Example: a Firebase/GCP app, with no changes to this repo.**
+
+1. User uploads a video to Firebase Storage; your backend creates a job record and gets a [signed URL](https://firebase.google.com/docs/storage/web/download-files) for the file.
+2. A Cloud Function (or Cloud Task) POSTs `{video_url: <signed URL>, job_id: <doc id>, secret: …}` to the `enqueue` endpoint and stores the returned `call_id` on the job record.
+3. An HTTPS Cloud Function at `WEBHOOK_URL` receives `{status, job_id, gcs_uri, size_bytes}`, verifies the `Authorization: Bearer` header against `WEBHOOK_SECRET`, and updates the job record — marking it failed (and e.g. refunding the user) when `status` is `"failed"`.
+4. The `.ply` is already in your `GCS_BUCKET`; serve it from there.
+
+The only deploy-time wiring is the `vid2scene-io` secret (bucket, webhook URL, tokens) — see [Run it: Modal](#run-it-modal). [3DStreet](https://3dstreet.app) integrates exactly this way behind its `generationJobs` queue.
 
 ---
 

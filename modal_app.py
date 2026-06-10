@@ -1,29 +1,29 @@
 """
-Modal deployment for the vid2scene video -> Gaussian-splat pipeline.
+Modal harness for the vid2scene video -> Gaussian-splat pipeline.
+
+predict.py makes the cog image runnable on Replicate; this file makes the SAME
+image runnable on Modal. Neither contains pipeline logic — both are thin,
+host-agnostic adapters around the code baked into the image.
 
 WHY THIS EXISTS
 ---------------
-Replicate's on-demand tier often preempts these long (~40 min) private jobs — 
-predictions may fail with `code: PA` / `Director ... E8765`. A controlled test
-on a dedicated, non-preemptible L40S ran the *exact same image* to success
-(peak VRAM only ~2.5 GB), proving the failures are platform preemption, not OOM
-or a code bug. Modal gives us non-preemptible, scale-to-zero, pay-per-job GPU
-execution with a 24h time limit (vs Cloud Run's hard 60-min cap, which the
-10M-gaussian top tier would blow past). See README.md ("Background: why run
-it off-Replicate").
+Replicate's on-demand tier preempts long (~tens of minutes) private jobs —
+predictions may fail with `code: PA` / `Director ... E8765`. The exact same
+image runs to success on dedicated hardware (peak VRAM only ~2.5 GB). Modal
+gives non-preemptible, scale-to-zero, pay-per-job GPU execution with a 24h
+limit (vs Cloud Run GPU's hard 60-min cap, which the largest presets would
+blow past). See README.md ("Background: why run it off-Replicate").
 
 THE KEY ARCHITECTURE: ONE IMAGE, TWO CONSUMERS
 ----------------------------------------------
-The container image `r8.im/kfarr/vid2scene` (built by cog.yaml on Hetzner) is the
-single source of truth — it bakes in the upstream pipeline, the CUDA binaries
-(colmap/glomap/gsplat), the deps, and predict.py. Replicate consumes it via
-`cog push`; Modal consumes the SAME image via `Image.from_registry(...)`. So any
-fix you make in cog.yaml/predict.py — rebuild + push once — propagates to BOTH
-platforms. This file is just the Modal-side harness (the analog of predict.py);
-it imports and reuses the existing Predictor so there is no logic duplication.
+The cog-built container image is the single source of truth — it bakes in the
+upstream pipeline, the CUDA binaries (colmap/glomap/gsplat), the deps, and
+predict.py. Replicate consumes it via `cog push`; Modal consumes the SAME
+image via `Image.from_registry(...)`. Any fix in cog.yaml/predict.py —
+rebuild + push once — propagates to BOTH platforms.
 
-    cog.yaml + predict.py  --cog build-->  r8.im/kfarr/vid2scene
-                                              /                \
+    cog.yaml + predict.py  --cog build-->  <registry>/<owner>/vid2scene
+                                              /                \\
                                        cog push            from_registry
                                           |                      |
                                       Replicate               this file
@@ -31,24 +31,40 @@ it imports and reuses the existing Predictor so there is no logic duplication.
 DEPLOY
 ------
     pip install modal && modal token new
-    # one-time: store the r8.im pull creds so Modal can pull the private image
-    modal secret create r8im-pull REGISTRY_USERNAME=kfarr REGISTRY_PASSWORD=<replicate-token>
-    # (optional) GCS creds for uploading the .ply, + a webhook secret
-    modal secret create vid2scene-io GCS_BUCKET=<bucket> WEBHOOK_URL=<3dstreet-callback> ...
+    # one-time: registry creds so Modal can pull the (private) image
+    modal secret create r8im-pull REGISTRY_USERNAME=<user> REGISTRY_PASSWORD=<token>
+    # I/O config — every key is optional; an unset key disables that feature:
+    #   GCS_BUCKET, GCS_PREFIX   upload the finished .ply to your GCS bucket
+    #   WEBHOOK_URL              POST completion/failure to your backend
+    #   WEBHOOK_SECRET           sent back as "Authorization: Bearer <secret>"
+    #   ENQUEUE_SECRET           require this token on enqueue requests
+    modal secret create vid2scene-io GCS_BUCKET=<bucket> WEBHOOK_URL=<url> ...
     modal deploy modal_app.py
 
-INVOKE  (see "Integrating with a host app" in README.md)
-------
-Production path is async: 3DStreet's Cloud Task POSTs to the `enqueue` web
-endpoint, which `.spawn()`s the job and returns a call id; the job uploads the
-.ply to GCS and POSTs a webhook back to 3DStreet's reconciler on completion.
-A synchronous `.remote()` path is included for local testing / calibration.
+THE CONTRACT — how any host app plugs in (Firebase/GCP, or anything HTTP)
+-------------------------------------------------------------------------
+1. SUBMIT   POST https://<workspace>--vid2scene-enqueue.modal.run
+              {"video_url": "<any fetchable URL — a signed Storage URL works>",
+               "job_id": "<your id, optional>", "secret": "<ENQUEUE_SECRET>",
+               ...quality knobs (see `run_split` params)}
+            -> {"call_id": "..."}  and the job runs asynchronously.
+2. RESULT   receive the webhook on your backend (e.g. a Cloud Function):
+              POST <WEBHOOK_URL>
+              {"status": "succeeded"|"failed", "job_id": "...",
+               "gcs_uri": "gs://...", "size_bytes": N}    (+ "error" on failure)
+            ...or skip webhooks and poll
+            modal.FunctionCall.from_id(call_id).get(timeout=0).
+3. FETCH    read the .ply from gcs_uri — it's your bucket.
+
+A synchronous `modal run` path is included at the bottom for local testing.
 """
 
+import json
 import os
 import shutil
 import sys
 import tempfile
+import time
 import urllib.request
 import uuid
 
@@ -73,7 +89,10 @@ image = (
     .pip_install("google-cloud-storage", "requests", "fastapi[standard]")
     # predict.py lives at the cog working dir (/src) in the image; make it import-
     # able so we can reuse Predictor.setup() + the pipeline entrypoint verbatim.
-    .env({"PYTHONPATH": "/src"})
+    # PYTHONUNBUFFERED is inherited by the gsplat trainer subprocess — without it
+    # the trainer's piped output sits in a block buffer and the whole training
+    # stage logs nothing until (unless) the process exits cleanly.
+    .env({"PYTHONPATH": "/src", "PYTHONUNBUFFERED": "1"})
 )
 
 app = modal.App("vid2scene")
@@ -85,11 +104,11 @@ CPU = float(os.environ.get("VID2SCENE_CPU", "16"))  # physical cores -> faster S
 MEMORY_MB = int(os.environ.get("VID2SCENE_MEM_MB", "32768"))
 TIMEOUT_S = int(os.environ.get("VID2SCENE_TIMEOUT_S", "7200"))  # 2h: covers max tier
 
-# Split-shape tunables (see "THE SPLIT SHAPE" below). Calibration run #1 measured
-# the single-function shape at ~$1.81/h — over the COGS cap for the default tier.
-# The job is two opposite workloads, so each stage gets its own machine:
+# Split-shape tunables (see "THE SPLIT SHAPE" below). The job is two opposite
+# workloads, so each stage gets its own machine:
 #   SfM:   CPU-hot, GPU only for hloc feature extraction/matching -> T4 + 16 cores
 #   train: GPU-hot, ~2 cores busy                                 -> L4 + 4 cores
+# Measured (default preset): split ≈ $0.94/job vs $1.36 single-function.
 SFM_GPU = os.environ.get("VID2SCENE_SFM_GPU", "T4")
 SFM_CPU = float(os.environ.get("VID2SCENE_SFM_CPU", "16"))
 SFM_MEM_MB = int(os.environ.get("VID2SCENE_SFM_MEM_MB", "24576"))
@@ -102,6 +121,19 @@ TRAIN_MEM_MB = int(os.environ.get("VID2SCENE_TRAIN_MEM_MB", "16384"))
 # and use the volume only to pass `sfm_output/` from one machine to the other;
 # the train stage deletes the job's directory once the .ply is shipped.
 work_volume = modal.Volume.from_name("vid2scene-work", create_if_missing=True)
+
+# Jobs that die between stages leak /work/<job_id> (sfm_output is a few GB);
+# completed jobs leave only a tiny result.json marker. Sweep both once they are
+# old enough that no retry can still want them.
+STALE_JOB_DAYS = 7
+
+
+def _sweep_stale_jobs(keep_job: str) -> None:
+    cutoff = time.time() - STALE_JOB_DAYS * 86400
+    for name in os.listdir("/work"):
+        path = os.path.join("/work", name)
+        if name != keep_job and os.path.getmtime(path) < cutoff:
+            shutil.rmtree(path, ignore_errors=True)
 
 
 def _load_predictor():
@@ -149,13 +181,16 @@ class Vid2Scene:
         remove_background: bool = False,
         apriltag_size_meters: float = 0.0,
     ) -> dict:
-        """Run one job. Returns {job_id, gcs_uri|None, size_bytes}. Uploads the
-        .ply to GCS and (if configured) POSTs a completion webhook."""
+        """Run one job on a single machine. Returns {job_id, gcs_uri|None,
+        size_bytes}; uploads the .ply to GCS and POSTs a success webhook if
+        configured. (Legacy shape — the split path is cheaper and also posts
+        failure webhooks.)"""
         work_dir = tempfile.mkdtemp(prefix="vid2scene_")
         out_dir = os.path.join(work_dir, "out")
         os.makedirs(out_dir, exist_ok=True)
 
-        # 1. fetch the input video (3DStreet passes a signed GCS/Firebase URL)
+        # 1. fetch the input video (any URL the container can reach — signed
+        #    GCS / Firebase Storage / S3 URLs are the usual choice)
         video_path = os.path.join(work_dir, "input")
         urllib.request.urlretrieve(video_url, video_path)
 
@@ -189,13 +224,13 @@ class Vid2Scene:
 
         size = os.path.getsize(candidate)
 
-        # 3. ship the result. Default: upload to GCS so 3DStreet streams it into
-        #    the gallery (its onSplatAssetCreated RAD/LOD step takes it from there).
+        # 3. ship the result: upload to the configured GCS bucket (skipped if
+        #    GCS_BUCKET is unset — the caller can still poll for this dict).
         gcs_uri = _upload_to_gcs(candidate, job_id) if os.environ.get("GCS_BUCKET") else None
 
         result = {"job_id": job_id, "gcs_uri": gcs_uri, "size_bytes": size}
 
-        # 4. tell 3DStreet's reconciler we're done (alternative to it polling).
+        # 4. notify the host app (alternative to it polling the FunctionCall).
         _post_webhook({"status": "succeeded", **result})
         return result
 
@@ -216,8 +251,6 @@ def _post_webhook(payload: dict) -> None:
     url = os.environ.get("WEBHOOK_URL")
     if not url:
         return
-    import json
-
     import requests
 
     headers = {"Content-Type": "application/json"}
@@ -264,6 +297,13 @@ class Vid2SceneSfM:
         apriltag_size_meters: float = 0.0,
     ) -> dict:
         """Stage A: video -> SfM artifacts, copied to /work/{job_id}/sfm_output."""
+        handoff_dir = os.path.join("/work", job_id, "sfm_output")
+        # Modal replays the same inputs when it retries a lost worker. If this
+        # job's SfM already reached the volume, don't pay for the stage twice.
+        work_volume.reload()
+        if os.path.isdir(handoff_dir):
+            return {"job_id": job_id, "normalize": not apriltag_size_meters}
+
         work_dir = tempfile.mkdtemp(prefix="vid2scene_")
         out_dir = os.path.join(work_dir, "out")
         os.makedirs(out_dir, exist_ok=True)
@@ -282,8 +322,7 @@ class Vid2SceneSfM:
             reconstruction_method=reconstruction_method,
         )
 
-        handoff_dir = os.path.join("/work", job_id, "sfm_output")
-        shutil.copytree(sfm_dir, handoff_dir)
+        shutil.copytree(sfm_dir, handoff_dir, dirs_exist_ok=True)
         work_volume.commit()
         shutil.rmtree(work_dir, ignore_errors=True)
         # AprilTag scaling fixes real-world units; training must not renormalize.
@@ -316,7 +355,14 @@ class Vid2SceneTrain:
     ) -> dict:
         """Stage B: /work/{job_id}/sfm_output -> .ply -> GCS + webhook."""
         work_volume.reload()
-        handoff_dir = os.path.join("/work", job_id, "sfm_output")
+        job_dir = os.path.join("/work", job_id)
+        handoff_dir = os.path.join(job_dir, "sfm_output")
+        marker_path = os.path.join(job_dir, "result.json")
+        # Retry of a job that already shipped (worker lost between our return and
+        # the caller receiving it): hand back the recorded result, train nothing.
+        if os.path.exists(marker_path):
+            with open(marker_path) as f:
+                return json.load(f)
         if not os.path.isdir(handoff_dir):
             raise RuntimeError(f"no SfM handoff at {handoff_dir} — did run_sfm succeed?")
 
@@ -347,8 +393,12 @@ class Vid2SceneTrain:
         gcs_uri = _upload_to_gcs(candidate, job_id) if os.environ.get("GCS_BUCKET") else None
         result = {"job_id": job_id, "gcs_uri": gcs_uri, "size_bytes": size}
 
-        # the handoff served its purpose; don't pay volume storage for it
-        shutil.rmtree(os.path.join("/work", job_id), ignore_errors=True)
+        # Drop the bulky handoff but leave a marker behind: retries short-circuit
+        # on it instead of failing with "no SfM handoff" after a successful run.
+        with open(marker_path, "w") as f:
+            json.dump(result, f)
+        shutil.rmtree(handoff_dir, ignore_errors=True)
+        _sweep_stale_jobs(keep_job=job_id)
         work_volume.commit()
         shutil.rmtree(work_dir, ignore_errors=True)
 
@@ -359,7 +409,11 @@ class Vid2SceneTrain:
 # Thin chaining function: ~zero-cost container (default CPU share) that waits on
 # stage A then launches stage B. Lets enqueue stay fire-and-forget with ONE call
 # id covering the whole job.
-@app.function(image=image, timeout=2 * TIMEOUT_S)
+@app.function(
+    image=image,
+    timeout=2 * TIMEOUT_S,
+    secrets=[modal.Secret.from_name("vid2scene-io")],
+)
 def run_split(
     video_url: str,
     job_id: str | None = None,
@@ -374,39 +428,55 @@ def run_split(
     apriltag_size_meters: float = 0.0,
 ) -> dict:
     job_id = job_id or uuid.uuid4().hex
-    sfm_result = Vid2SceneSfM().run_sfm.remote(
-        video_url,
-        job_id=job_id,
-        reconstruction_method=reconstruction_method,
-        target_framecount=target_framecount,
-        resolution=resolution,
-        equirectangular=equirectangular,
-        use_background_sphere=use_background_sphere,
-        remove_background=remove_background,
-        apriltag_size_meters=apriltag_size_meters,
-    )
-    return Vid2SceneTrain().run_train.remote(
-        job_id=job_id,
-        training_num_steps=training_num_steps,
-        training_max_num_gaussians=training_max_num_gaussians,
-        normalize=sfm_result["normalize"],
-    )
+    try:
+        sfm_result = Vid2SceneSfM().run_sfm.remote(
+            video_url,
+            job_id=job_id,
+            reconstruction_method=reconstruction_method,
+            target_framecount=target_framecount,
+            resolution=resolution,
+            equirectangular=equirectangular,
+            use_background_sphere=use_background_sphere,
+            remove_background=remove_background,
+            apriltag_size_meters=apriltag_size_meters,
+        )
+        return Vid2SceneTrain().run_train.remote(
+            job_id=job_id,
+            training_num_steps=training_num_steps,
+            training_max_num_gaussians=training_max_num_gaussians,
+            normalize=sfm_result["normalize"],
+        )
+    except Exception as e:
+        # Host apps need failure callbacks too (e.g. to refund a charge or
+        # surface an error state) — the success webhook fires in run_train.
+        _post_webhook({"status": "failed", "job_id": job_id, "error": str(e)[:1000]})
+        raise
 
 
-# --- Async enqueue endpoint: this is what 3DStreet's Cloud Task hits ----------
-# It spawns the job and returns immediately with a call id. 3DStreet stores that
-# id on the generationJobs row; the reconciler either waits for the webhook above
-# or polls modal.FunctionCall.from_id(call_id).get(timeout=0). This is the
-# Modal-side of the "compute backend behind the host's queue" — see README.md.
+# --- Async enqueue endpoint: the HTTP front door for host apps ----------------
+# A host app's queue/task system POSTs here; the job is spawned and a call id
+# returned immediately. The host then either waits for the webhook (see
+# _post_webhook) or polls modal.FunctionCall.from_id(call_id).get(timeout=0).
+# The model stays a stateless compute backend behind the HOST's queue — this
+# endpoint adds no queue of its own. See README.md "Integrating with a host app".
 @app.function(image=image, secrets=[modal.Secret.from_name("vid2scene-io")])
 @modal.fastapi_endpoint(method="POST")
 def enqueue(body: dict) -> dict:
-    """POST {video_url, job_id, ...knobs} -> {call_id}. Fire-and-forget.
-    Pass "split": false to use the legacy single-machine shape."""
-    if os.environ.get("ENQUEUE_SECRET"):
-        # NOTE: wire real request-auth here (shared secret / OIDC) before prod.
-        pass
+    """POST {video_url, job_id?, secret?, ...knobs} -> {call_id}. Fire-and-forget.
+    Pass "split": false to use the legacy single-machine shape (success webhook
+    only; the default split shape also posts failure webhooks)."""
+    # Shared-token auth: set ENQUEUE_SECRET in the vid2scene-io secret and have
+    # callers include it as "secret" in the body. For header-based auth instead,
+    # Modal's built-in proxy auth (requires_proxy_auth=True above) works without
+    # any code here.
+    expected = os.environ.get("ENQUEUE_SECRET")
+    if expected and body.pop("secret", None) != expected:
+        return {"error": "unauthorized"}
+    body.pop("secret", None)
     video_url = body.pop("video_url")
+    # Pin the job_id at enqueue time: Modal replays a lost run_split with the
+    # same inputs, and the idempotent stages key their prior work off this id.
+    body.setdefault("job_id", uuid.uuid4().hex)
     if body.pop("split", True):
         call = run_split.spawn(video_url, **body)
     else:
@@ -426,11 +496,14 @@ def main(
     frames: int = 600,
     resolution: int = 1920,
     split: bool = False,
+    job_id: str = "",
 ):
     if split:
         res = run_split.remote(
             video_url,
-            job_id=f"local-test-{uuid.uuid4().hex[:8]}",
+            # Reusing a previous run's job_id resumes it: stages whose artifacts
+            # already reached the volume are skipped.
+            job_id=job_id or f"local-test-{uuid.uuid4().hex[:8]}",
             target_framecount=frames,
             resolution=resolution,
             training_max_num_gaussians=gaussians,
