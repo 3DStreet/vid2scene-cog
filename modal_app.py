@@ -154,6 +154,16 @@ def _sweep_stale_jobs(keep_job: str) -> None:
             shutil.rmtree(path, ignore_errors=True)
 
 
+def _fetch_video(video_url: str, video_path: str) -> None:
+    # A clean, picklable error: HTTPError carries a live socket reader, which
+    # Modal can't serialize back to the coordinator — the host app would see an
+    # exception-serialization artifact instead of the actual failure.
+    try:
+        urllib.request.urlretrieve(video_url, video_path)
+    except Exception as e:
+        raise RuntimeError(f"failed to download input video: {e}") from None
+
+
 def _load_predictor():
     """Predictor from the baked predict.py — the same code Replicate runs."""
     if "/src" not in sys.path:
@@ -211,7 +221,7 @@ class Vid2Scene:
         # 1. fetch the input video (any URL the container can reach — signed
         #    GCS / Firebase Storage / S3 URLs are the usual choice)
         video_path = os.path.join(work_dir, "input")
-        urllib.request.urlretrieve(video_url, video_path)
+        _fetch_video(video_url, video_path)
 
         # 2. run the pipeline (same entrypoint & cwd contract as predict.py)
         prev_cwd = os.getcwd()
@@ -337,7 +347,7 @@ class Vid2SceneSfM:
         out_dir = os.path.join(work_dir, "out")
         os.makedirs(out_dir, exist_ok=True)
         video_path = os.path.join(work_dir, "input")
-        urllib.request.urlretrieve(video_url, video_path)
+        _fetch_video(video_url, video_path)
 
         sfm_dir = self._predictor.run_sfm(
             video_path=video_path,
