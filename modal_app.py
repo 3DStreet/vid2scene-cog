@@ -108,6 +108,13 @@ image = (
 
 app = modal.App("vid2scene")
 
+# Lightweight image for the control-plane functions (enqueue/status/run_split):
+# they never touch the pipeline, and the multi-GB cog image gives web endpoints
+# multi-minute cold starts on uncached workers. Slim cold-starts in ~1 s.
+control_image = modal.Image.debian_slim(python_version="3.10").pip_install(
+    "fastapi[standard]", "requests"
+)
+
 # Tunables. SfM (the ~27-min CPU-bound stage) dominates wall-clock, so give it
 # real cores; gsplat needs the GPU but barely any VRAM (2.5 GB measured).
 GPU = os.environ.get("VID2SCENE_GPU", "L4")        # L4/24GB is ample; T4 also fits
@@ -437,7 +444,7 @@ class Vid2SceneTrain:
 # stage A then launches stage B. Lets enqueue stay fire-and-forget with ONE call
 # id covering the whole job.
 @app.function(
-    image=image,
+    image=control_image,
     timeout=2 * TIMEOUT_S,
     secrets=[modal.Secret.from_name("vid2scene-io")],
 )
@@ -491,7 +498,7 @@ def run_split(
 # _post_webhook) or polls modal.FunctionCall.from_id(call_id).get(timeout=0).
 # The model stays a stateless compute backend behind the HOST's queue — this
 # endpoint adds no queue of its own. See README.md "Integrating with a host app".
-@app.function(image=image, secrets=[modal.Secret.from_name("vid2scene-io")])
+@app.function(image=control_image, secrets=[modal.Secret.from_name("vid2scene-io")])
 @modal.fastapi_endpoint(method="POST")
 def enqueue(body: dict) -> dict:
     """POST {video_url, job_id?, secret?, ...knobs} -> {call_id}. Fire-and-forget.
@@ -519,7 +526,7 @@ def enqueue(body: dict) -> dict:
 # Poll companion to `enqueue`: hosts whose backends have no Modal SDK (e.g. a
 # Node reconciler) GET this with the call_id they stored at submit time. This
 # is the safety net for dropped webhooks, not the primary completion signal.
-@app.function(image=image, secrets=[modal.Secret.from_name("vid2scene-io")])
+@app.function(image=control_image, secrets=[modal.Secret.from_name("vid2scene-io")])
 @modal.fastapi_endpoint(method="GET")
 def status(call_id: str, secret: str = "") -> dict:
     """GET ?call_id=...&secret=... ->
