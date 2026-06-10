@@ -35,9 +35,12 @@ DEPLOY
     modal secret create r8im-pull REGISTRY_USERNAME=<user> REGISTRY_PASSWORD=<token>
     # I/O config — every key is optional; an unset key disables that feature:
     #   GCS_BUCKET, GCS_PREFIX   upload the finished .ply to your GCS bucket
+    #   GCS_SA_JSON              service-account key JSON for the upload (Modal
+    #                            containers have no ambient GCP credentials)
     #   WEBHOOK_URL              POST completion/failure to your backend
+    #                            (a per-job "webhook_url" in the enqueue body wins)
     #   WEBHOOK_SECRET           sent back as "Authorization: Bearer <secret>"
-    #   ENQUEUE_SECRET           require this token on enqueue requests
+    #   ENQUEUE_SECRET           require this token on enqueue/status requests
     modal secret create vid2scene-io GCS_BUCKET=<bucket> WEBHOOK_URL=<url> ...
     modal deploy modal_app.py
 
@@ -46,14 +49,17 @@ THE CONTRACT — how any host app plugs in (Firebase/GCP, or anything HTTP)
 1. SUBMIT   POST https://<workspace>--vid2scene-enqueue.modal.run
               {"video_url": "<any fetchable URL — a signed Storage URL works>",
                "job_id": "<your id, optional>", "secret": "<ENQUEUE_SECRET>",
+               "webhook_url": "<per-job callback URL, optional>",
                ...quality knobs (see `run_split` params)}
             -> {"call_id": "..."}  and the job runs asynchronously.
 2. RESULT   receive the webhook on your backend (e.g. a Cloud Function):
-              POST <WEBHOOK_URL>
+              POST <webhook_url or WEBHOOK_URL>
               {"status": "succeeded"|"failed", "job_id": "...",
                "gcs_uri": "gs://...", "size_bytes": N}    (+ "error" on failure)
-            ...or skip webhooks and poll
-            modal.FunctionCall.from_id(call_id).get(timeout=0).
+            ...or poll without a Modal SDK:
+              GET https://<workspace>--vid2scene-status.modal.run
+                  ?call_id=...&secret=<ENQUEUE_SECRET>
+              -> {"status": "running"|"succeeded"|"failed"|"expired", ...}
 3. FETCH    read the .ply from gcs_uri — it's your bucket.
 
 A synchronous `modal run` path is included at the bottom for local testing.
@@ -87,6 +93,11 @@ image = (
     # Host-side helpers for I/O glue (the pipeline itself needs none of these).
     # fastapi is required by the @modal.fastapi_endpoint `enqueue` route.
     .pip_install("google-cloud-storage", "requests", "fastapi[standard]")
+    # cog bakes the WHOLE repo at /src — including a build-time copy of THIS
+    # file. With PYTHONPATH=/src below, that stale copy would shadow the
+    # version Modal mounts at deploy time, so deployed functions silently run
+    # old code. Remove it; predict.py is the only thing we import from /src.
+    .run_commands("rm -rf /src/modal_app.py /src/__pycache__")
     # predict.py lives at the cog working dir (/src) in the image; make it import-
     # able so we can reuse Predictor.setup() + the pipeline entrypoint verbatim.
     # PYTHONUNBUFFERED is inherited by the gsplat trainer subprocess — without it
@@ -180,6 +191,7 @@ class Vid2Scene:
         use_background_sphere: bool = True,
         remove_background: bool = False,
         apriltag_size_meters: float = 0.0,
+        webhook_url: str | None = None,
     ) -> dict:
         """Run one job on a single machine. Returns {job_id, gcs_uri|None,
         size_bytes}; uploads the .ply to GCS and POSTs a success webhook if
@@ -231,7 +243,7 @@ class Vid2Scene:
         result = {"job_id": job_id, "gcs_uri": gcs_uri, "size_bytes": size}
 
         # 4. notify the host app (alternative to it polling the FunctionCall).
-        _post_webhook({"status": "succeeded", **result})
+        _post_webhook({"status": "succeeded", **result}, url=webhook_url)
         return result
 
 
@@ -241,14 +253,24 @@ def _upload_to_gcs(local_path: str, job_id: str | None) -> str:
     bucket_name = os.environ["GCS_BUCKET"]
     prefix = os.environ.get("GCS_PREFIX", "vid2scene")
     name = f"{prefix}/{job_id or os.path.basename(local_path)}.ply"
-    client = storage.Client()
+    # Modal containers carry no ambient GCP credentials — pass a service-account
+    # key as the GCS_SA_JSON secret (the raw JSON). Default creds remain the
+    # fallback for environments that do have them.
+    sa_json = os.environ.get("GCS_SA_JSON")
+    client = (
+        storage.Client.from_service_account_info(json.loads(sa_json))
+        if sa_json
+        else storage.Client()
+    )
     blob = client.bucket(bucket_name).blob(name)
     blob.upload_from_filename(local_path, content_type="application/octet-stream")
     return f"gs://{bucket_name}/{name}"
 
 
-def _post_webhook(payload: dict) -> None:
-    url = os.environ.get("WEBHOOK_URL")
+def _post_webhook(payload: dict, url: str | None = None) -> None:
+    # Per-job URL (e.g. one carrying a signed token in its query string) wins;
+    # the static WEBHOOK_URL secret is the fallback for hosts with one endpoint.
+    url = url or os.environ.get("WEBHOOK_URL")
     if not url:
         return
     import requests
@@ -352,6 +374,7 @@ class Vid2SceneTrain:
         training_num_steps: int = 30000,
         training_max_num_gaussians: int = 500000,
         normalize: bool = True,
+        webhook_url: str | None = None,
     ) -> dict:
         """Stage B: /work/{job_id}/sfm_output -> .ply -> GCS + webhook."""
         work_volume.reload()
@@ -360,9 +383,13 @@ class Vid2SceneTrain:
         marker_path = os.path.join(job_dir, "result.json")
         # Retry of a job that already shipped (worker lost between our return and
         # the caller receiving it): hand back the recorded result, train nothing.
+        # Re-post the webhook too — the loss may have raced the original POST,
+        # and hosts must treat terminal callbacks as idempotent anyway.
         if os.path.exists(marker_path):
             with open(marker_path) as f:
-                return json.load(f)
+                result = json.load(f)
+            _post_webhook({"status": "succeeded", **result}, url=webhook_url)
+            return result
         if not os.path.isdir(handoff_dir):
             raise RuntimeError(f"no SfM handoff at {handoff_dir} — did run_sfm succeed?")
 
@@ -402,7 +429,7 @@ class Vid2SceneTrain:
         work_volume.commit()
         shutil.rmtree(work_dir, ignore_errors=True)
 
-        _post_webhook({"status": "succeeded", **result})
+        _post_webhook({"status": "succeeded", **result}, url=webhook_url)
         return result
 
 
@@ -426,6 +453,7 @@ def run_split(
     use_background_sphere: bool = True,
     remove_background: bool = False,
     apriltag_size_meters: float = 0.0,
+    webhook_url: str | None = None,
 ) -> dict:
     job_id = job_id or uuid.uuid4().hex
     try:
@@ -445,11 +473,15 @@ def run_split(
             training_num_steps=training_num_steps,
             training_max_num_gaussians=training_max_num_gaussians,
             normalize=sfm_result["normalize"],
+            webhook_url=webhook_url,
         )
     except Exception as e:
         # Host apps need failure callbacks too (e.g. to refund a charge or
         # surface an error state) — the success webhook fires in run_train.
-        _post_webhook({"status": "failed", "job_id": job_id, "error": str(e)[:1000]})
+        _post_webhook(
+            {"status": "failed", "job_id": job_id, "error": str(e)[:1000]},
+            url=webhook_url,
+        )
         raise
 
 
@@ -482,6 +514,32 @@ def enqueue(body: dict) -> dict:
     else:
         call = Vid2Scene().run.spawn(video_url, **body)
     return {"call_id": call.object_id}
+
+
+# Poll companion to `enqueue`: hosts whose backends have no Modal SDK (e.g. a
+# Node reconciler) GET this with the call_id they stored at submit time. This
+# is the safety net for dropped webhooks, not the primary completion signal.
+@app.function(image=image, secrets=[modal.Secret.from_name("vid2scene-io")])
+@modal.fastapi_endpoint(method="GET")
+def status(call_id: str, secret: str = "") -> dict:
+    """GET ?call_id=...&secret=... ->
+    {"status": "running"|"succeeded"|"failed"|"expired", "result"?, "error"?}"""
+    expected = os.environ.get("ENQUEUE_SECRET")
+    if expected and secret != expected:
+        return {"error": "unauthorized"}
+    try:
+        call = modal.FunctionCall.from_id(call_id)
+        result = call.get(timeout=0)
+        return {"status": "succeeded", "result": result}
+    except (TimeoutError, modal.exception.TimeoutError):
+        return {"status": "running"}
+    except modal.exception.OutputExpiredError:
+        # Results are only retained ~7 days; an expired job is long since
+        # terminal — the host's give-up timeout should have fired well before.
+        return {"status": "expired"}
+    except Exception as e:
+        # .get() re-raises whatever the job raised -> the job failed.
+        return {"status": "failed", "error": str(e)[:1000]}
 
 
 # --- Local test / calibration -------------------------------------------------
