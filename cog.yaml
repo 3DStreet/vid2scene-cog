@@ -73,7 +73,13 @@ build:
     # vggt/sam3/quest/svraster (alt methods / SaaS) to keep the image bootable on
     # Replicate. The `vggt` reconstruction method is not exposed by predict.py, so
     # its top-level import in vid2scene.py is stubbed to a clear error.
-    - "git clone https://github.com/3DStreet/vid2scene.git /src/vid2scene && cd /src/vid2scene && git checkout eca9db7cd6b063175832f5aced0bbbfbc09cef7a && git submodule update --init --recursive glomap gsplat Hierarchical-Localization"
+    # NETWORK: GitHub's git protocol from Hetzner is per-connection roulette
+    # (~30 KB/s or ~40 MB/s; even a shallow clone is ~900 MB). Abort any
+    # transfer that drops under 500 KB/s for 30s and retry for a fresh draw.
+    # The pin is the cog-phase1 branch tip, hash-VERIFIED after the shallow
+    # clone (a moved branch fails the build instead of drifting).
+    - "git config --global http.lowSpeedLimit 500000 && git config --global http.lowSpeedTime 30"
+    - "c() { rm -rf /src/vid2scene; git clone --depth 1 --branch cog-phase1 https://github.com/3DStreet/vid2scene.git /src/vid2scene; }; c || c || c || c || c; cd /src/vid2scene && git rev-parse HEAD | grep -q ^eca9db7cd6b063175832f5aced0bbbfbc09cef7a && s() { git submodule update --init --recursive glomap gsplat Hierarchical-Localization; }; s || s || s"
     - "sed -i 's|^from vggt_to_colmap import run_vggt_to_colmap|def run_vggt_to_colmap(*a, **k): raise RuntimeError(\"vggt reconstruction method is not bundled in this Cog\")|' /src/vid2scene/vid2scene_core/vid2scene.py"
     # Build glomap (default SfM — pure C++ global SfM, no model weights). Finds
     # the COLMAP install above. Installs the `glomap` binary to /usr/local/bin.
