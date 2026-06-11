@@ -79,7 +79,7 @@ build:
     # The pin is the cog-phase1 branch tip, hash-VERIFIED after the shallow
     # clone (a moved branch fails the build instead of drifting).
     - "git config --global http.lowSpeedLimit 500000 && git config --global http.lowSpeedTime 30"
-    - "c() { rm -rf /src/vid2scene; git clone --depth 1 --branch cog-phase1 https://github.com/3DStreet/vid2scene.git /src/vid2scene; }; c || c || c || c || c; cd /src/vid2scene && git rev-parse HEAD | grep -q ^eca9db7cd6b063175832f5aced0bbbfbc09cef7a && s() { git submodule update --init --recursive glomap gsplat Hierarchical-Localization; }; s || s || s"
+    - "c() { rm -rf /src/vid2scene; git clone --depth 1 --branch cog-phase1 https://github.com/3DStreet/vid2scene.git /src/vid2scene; }; c || c || c || c || c; cd /src/vid2scene && git rev-parse HEAD | grep -q ^bb60308033155ab7ba2a71f9e4bb4d8454c62cca && s() { git submodule update --init --recursive glomap gsplat Hierarchical-Localization; }; s || s || s"
     - "sed -i 's|^from vggt_to_colmap import run_vggt_to_colmap|def run_vggt_to_colmap(*a, **k): raise RuntimeError(\"vggt reconstruction method is not bundled in this Cog\")|' /src/vid2scene/vid2scene_core/vid2scene.py"
     # Build glomap (default SfM — pure C++ global SfM, no model weights). Finds
     # the COLMAP install above. Installs the `glomap` binary to /usr/local/bin.
