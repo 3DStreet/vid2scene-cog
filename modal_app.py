@@ -307,6 +307,19 @@ def _post_webhook(payload: dict, url: str | None = None) -> None:
 # (train, L4+4cpu) ≈ $0.94 vs ~$1.36 measured on the single-function shape.
 
 
+def _gpu_name() -> str | None:
+    """The actual GPU this container landed on (e.g. 'Tesla T4', 'NVIDIA L4').
+    Reported in the result timings so the host can cost jobs per stage — read
+    from hardware rather than the VID2SCENE_*_GPU env knobs, which are only
+    set in the deploy-time process, not inside containers."""
+    try:
+        import torch
+
+        return torch.cuda.get_device_name(0)
+    except Exception:
+        return None
+
+
 @app.cls(
     image=image,
     gpu=SFM_GPU,
@@ -341,8 +354,11 @@ class Vid2SceneSfM:
         # job's SfM already reached the volume, don't pay for the stage twice.
         work_volume.reload()
         if os.path.isdir(handoff_dir):
+            # Replay of an already-shipped stage: no timing keys — the compute
+            # was reported (and billed) by the attempt that did the work.
             return {"job_id": job_id, "normalize": not apriltag_size_meters}
 
+        t0 = time.time()
         work_dir = tempfile.mkdtemp(prefix="vid2scene_")
         out_dir = os.path.join(work_dir, "out")
         os.makedirs(out_dir, exist_ok=True)
@@ -365,7 +381,14 @@ class Vid2SceneSfM:
         work_volume.commit()
         shutil.rmtree(work_dir, ignore_errors=True)
         # AprilTag scaling fixes real-world units; training must not renormalize.
-        return {"job_id": job_id, "normalize": not apriltag_size_meters}
+        return {
+            "job_id": job_id,
+            "normalize": not apriltag_size_meters,
+            # Per-stage compute time + hardware, threaded through run_split into
+            # the final result so the host can track per-job COGS over time.
+            "sfm_seconds": round(time.time() - t0, 1),
+            "sfm_gpu": _gpu_name(),
+        }
 
 
 @app.cls(
@@ -392,8 +415,12 @@ class Vid2SceneTrain:
         training_max_num_gaussians: int = 500000,
         normalize: bool = True,
         webhook_url: str | None = None,
+        timings: dict | None = None,
     ) -> dict:
-        """Stage B: /work/{job_id}/sfm_output -> .ply -> GCS + webhook."""
+        """Stage B: /work/{job_id}/sfm_output -> .ply -> GCS + webhook.
+        `timings` carries stage A's sfm_seconds/sfm_gpu; this stage adds its
+        own and ships the merged dict in the result."""
+        t0 = time.time()
         work_volume.reload()
         job_dir = os.path.join("/work", job_id)
         handoff_dir = os.path.join(job_dir, "sfm_output")
@@ -435,7 +462,16 @@ class Vid2SceneTrain:
 
         size = os.path.getsize(candidate)
         gcs_uri = _upload_to_gcs(candidate, job_id) if os.environ.get("GCS_BUCKET") else None
-        result = {"job_id": job_id, "gcs_uri": gcs_uri, "size_bytes": size}
+        result = {
+            "job_id": job_id,
+            "gcs_uri": gcs_uri,
+            "size_bytes": size,
+            "timings": {
+                **(timings or {}),
+                "train_seconds": round(time.time() - t0, 1),
+                "train_gpu": _gpu_name(),
+            },
+        }
 
         # Drop the bulky handoff but leave a marker behind: retries short-circuit
         # on it instead of failing with "no SfM handoff" after a successful run.
@@ -491,6 +527,7 @@ def run_split(
             training_max_num_gaussians=training_max_num_gaussians,
             normalize=sfm_result["normalize"],
             webhook_url=webhook_url,
+            timings={k: sfm_result[k] for k in ("sfm_seconds", "sfm_gpu") if k in sfm_result},
         )
     except Exception as e:
         # Host apps need failure callbacks too (e.g. to refund a charge or
