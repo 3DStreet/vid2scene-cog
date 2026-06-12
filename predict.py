@@ -15,13 +15,16 @@ user's gallery, and the downstream RAD/LOD Cloud Run pipeline
 (`onSplatAssetCreated`) optimizes it — so nothing past "produce the .ply" needs
 to change. See docs/vid2scene-video-to-splat.md.
 
-The upstream entrypoint signature (3DStreet/vid2scene fork, cog-phase1 — adds
-max_resolution / stop_after_sfm / normalize_override over samuelm2 upstream):
+The upstream entrypoint signature (3DStreet/vid2scene fork, cog-phase2 — adds
+max_resolution / stop_after_sfm / normalize_override and the direct .insv
+dual-fisheye path over samuelm2 upstream):
 
     process_video_to_scene(
         video_path=None, image_dir=None, output_dir=None, sfm_dir=None,
         target_framecount=600, preview_data_handler=None,
         remove_background_from_images=False, equirectangular=False,
+        insv_fisheye=False, insv_lens_fov=None, insv_calibration=None,
+        insv_no_factory_calibration=False,
         use_background_sphere=False, apply_pilgram_filter_name=None,
         training_max_num_gaussians=1_000_000, training_num_steps=30_000,
         kill_check=None, reconstruction_method='glomap',
@@ -198,6 +201,7 @@ class Predictor(BasePredictor):
         target_framecount: int = 600,
         resolution: int = 1920,
         equirectangular: bool = False,
+        insv_fisheye: bool = False,
         use_background_sphere: bool = True,
         remove_background: bool = False,
         apriltag_size_meters: float | None = None,
@@ -211,6 +215,7 @@ class Predictor(BasePredictor):
             target_framecount=target_framecount,
             max_resolution=resolution,
             equirectangular=equirectangular,
+            insv_fisheye=insv_fisheye,
             use_background_sphere=use_background_sphere,
             remove_background_from_images=remove_background,
             apriltag_size_meters=apriltag_size_meters,
@@ -286,6 +291,10 @@ class Predictor(BasePredictor):
             description="Treat the input as 360/equirectangular video.",
             default=False,
         ),
+        insv_fisheye: bool = Input(
+            description="Treat the input as a raw Insta360 .insv recording and reconstruct directly from its dual fisheye streams (better ground/sky detail than a pre-stitched equirectangular). Required for .insv through this wrapper: the staged input file loses its extension, so the pipeline's auto-detection never fires.",
+            default=False,
+        ),
         use_background_sphere: bool = Input(
             description="Add a background sphere for distant/sky content. Helps outdoor or 360 captures where the background is far away.",
             default=True,
@@ -323,6 +332,7 @@ class Predictor(BasePredictor):
                 target_framecount=target_framecount,
                 resolution=resolution,
                 equirectangular=equirectangular,
+                insv_fisheye=insv_fisheye,
                 use_background_sphere=use_background_sphere,
                 remove_background=remove_background,
                 # 0 (the optional default) means "no AprilTag" — pass None so the
